@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import warnings
+from collections.abc import Iterator
 from typing import Optional, Union, overload
 
 from zvec._zvec import _Collection
@@ -377,6 +378,42 @@ class Collection:
             for doc_id, core_doc in docs.items()
             if (py_doc := convert_to_py_doc(core_doc, self.schema)) is not None
         }
+
+    def iter_docs(
+        self,
+        *,
+        output_fields: Optional[list[str]] = None,
+        include_vector: bool = True,
+    ) -> Iterator[Doc]:
+        """Iterate over all documents in the collection.
+
+        Streams documents one by one using an isolated snapshot taken at call
+        time: memory usage stays constant regardless of collection size, and
+        data written after the iterator is created is not visible.
+
+        Args:
+            output_fields (Optional[list[str]], optional): Scalar fields to
+                include. If None, all fields are returned. Defaults to None.
+            include_vector (bool, optional): Whether to include vector data in
+                each document. Defaults to True.
+
+        Yields:
+            Doc: Each document in the collection.
+
+        Examples:
+            >>> for doc in collection.iter_docs(include_vector=False):
+            ...     print(doc.id, doc.field("title"))
+        """
+        iterator = self._obj.CreateIterator(output_fields, include_vector)
+        try:
+            for core_doc in iterator:
+                py_doc = convert_to_py_doc(core_doc, self.schema)
+                if py_doc is not None:
+                    yield py_doc
+        finally:
+            # Release native resources (segments, file handles) even if the
+            # caller stops early (e.g. breaks out of the loop).
+            iterator.close()
 
     # ========== Collection DQL-Query Methods ==========
 

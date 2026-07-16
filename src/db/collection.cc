@@ -19,6 +19,7 @@
 #include <set>
 #include <shared_mutex>
 #include <string>
+#include <unordered_set>
 #include <variant>
 #include <vector>
 #include <ailego/io/file_lock.h>
@@ -28,6 +29,7 @@
 #include <zvec/ailego/utility/file_helper.h>
 #include <zvec/db/collection.h>
 #include <zvec/db/doc.h>
+#include <zvec/db/doc_iterator.h>
 #include <zvec/db/options.h>
 #include <zvec/db/reranker.h>
 #include <zvec/db/schema.h>
@@ -37,11 +39,14 @@
 #include "db/common/global_resource.h"
 #include "db/common/profiler.h"
 #include "db/common/typedef.h"
+#include "db/doc_iterator_internal.h"
 #include "db/index/common/delete_store.h"
 #include "db/index/common/id_map.h"
 #include "db/index/common/index_filter.h"
 #include "db/index/common/type_helper.h"
 #include "db/index/common/version_manager.h"
+#include "db/index/segment/concatenating_reader.h"
+#include "db/index/segment/filtering_reader.h"
 #include "db/index/segment/segment.h"
 #include "db/index/segment/segment_helper.h"
 #include "db/index/segment/segment_manager.h"
@@ -131,6 +136,9 @@ class CollectionImpl : public Collection {
                               &output_fields = std::nullopt,
                           bool include_vector = true) const override;
 
+  Result<DocIterator::Ptr> CreateIterator(
+      const IteratorOptions &options = {}) override;
+
   Result<std::string> DebugGetHnswStorageMode(
       const std::string &column_name) const override;
 
@@ -166,6 +174,18 @@ class CollectionImpl : public Collection {
       Version *new_version, uint64_t writing_min_doc_id);
 
   Result<WriteResults> write_impl(std::vector<Doc> &docs, WriteMode mode);
+
+  // Build scan columns: prepend GLOBAL_DOC_ID + USER_ID to user-specified
+  // fields If output_fields is nullopt, include all forward_fields
+  std::vector<std::string> build_scan_columns(
+      const std::optional<std::vector<std::string>> &output_fields) const;
+
+  // Isolated scan: Flush + snapshot + clone + reader chain
+  // segments/delete_store filled by Scan for caller to keep alive
+  Result<RecordBatchReaderPtr> Scan(const IteratorOptions &options,
+                                    std::vector<Segment::Ptr> &segments,
+                                    DeleteStore::Ptr &delete_store,
+                                    CollectionSchema::Ptr &schema);
 
   std::vector<Segment::Ptr> get_all_segments() const;
 
@@ -2083,6 +2103,123 @@ std::vector<Segment::Ptr> CollectionImpl::get_all_segments() const {
 
 std::vector<Segment::Ptr> CollectionImpl::get_all_persist_segments() const {
   return segment_manager_->get_segments();
+}
+
+std::vector<std::string> CollectionImpl::build_scan_columns(
+    const std::optional<std::vector<std::string>> &output_fields) const {
+  // Same logic as Segment::Fetch()
+  std::vector<std::string> columns;
+  columns.push_back(GLOBAL_DOC_ID);  // _zvec_g_doc_id_
+  columns.push_back(USER_ID);        // _zvec_uid_
+
+  if (!output_fields.has_value()) {
+    // nullopt = all forward fields
+    for (const auto &field : schema_->forward_fields()) {
+      columns.push_back(field->name());
+    }
+  } else {
+    // Only requested fields
+    const auto &requested = *output_fields;
+    std::unordered_set<std::string> requested_set(requested.begin(),
+                                                  requested.end());
+    for (const auto &field : schema_->forward_fields()) {
+      if (requested_set.count(field->name())) {
+        columns.push_back(field->name());
+      }
+    }
+  }
+
+  return columns;
+}
+
+Result<RecordBatchReaderPtr> CollectionImpl::Scan(
+    const IteratorOptions &options, std::vector<Segment::Ptr> &segments,
+    DeleteStore::Ptr &delete_store, CollectionSchema::Ptr &schema) {
+  // shared_lock blocks Optimize (exclusive) and schema changes (exclusive)
+  // but allows concurrent Query/Fetch (shared)
+  std::shared_lock<std::shared_mutex> schema_lock(schema_handle_mtx_);
+  CHECK_DESTROY_RETURN_STATUS_EXPECTED(destroyed_, false);
+
+  // Capture the schema under schema_handle_mtx_ so the iterator interprets
+  // batches with the same schema used to build the reader (avoids a race with
+  // a concurrent schema change between Scan() and CreateIterator()).
+  schema = schema_;
+
+  {
+    // write_mtx_ blocks concurrent writes (Insert/Upsert/Update/Delete)
+    // auto-released when scope exits
+    std::lock_guard<std::shared_mutex> write_lock(write_mtx_);
+
+    if (options_.read_only_) {
+      // Read-only: cannot flush (that writes to disk, violating read-only).
+      // Read the writing segment directly instead — SegmentImpl::scan() also
+      // reads the in-memory writing block, and a read-only collection has no
+      // concurrent writes, so the snapshot is stable and complete.
+      segments = get_all_segments();  // persist segments + writing segment
+    } else {
+      // Writable: flush the writing segment to seal it against concurrent
+      // writes, then snapshot the persist segments (now including it).
+      if (writing_segment_->doc_count() != 0) {
+        auto s = switch_to_new_segment_for_writing();
+        CHECK_RETURN_STATUS_EXPECTED(s);
+      }
+      segments = get_all_persist_segments();
+    }
+
+    // Deep clone DeleteStore bitmap
+    delete_store = delete_store_->clone();
+  }  // ← write_mtx_ released, concurrent writes resume
+
+  // Build reader chain (shared_lock still held, blocks schema changes)
+  auto scan_columns = build_scan_columns(options.output_fields_);
+
+  std::vector<std::shared_ptr<arrow::RecordBatchReader>> readers;
+  for (const auto &seg : segments) {
+    auto scalar_reader = seg->scan(scan_columns);
+    if (scalar_reader) {
+      readers.push_back(scalar_reader);
+    } else {
+      LOG_ERROR("Segment::scan returned no reader; skipping a segment");
+    }
+  }
+  // Vectors are not read here; DocIterator::Next() batch-prefetches them from
+  // each segment's vector indexer.
+
+  // Concatenate across segments
+  auto concat_reader = ConcatenatingReader::Make(std::move(readers));
+
+  // Wrap with delete filter
+  auto filter = delete_store->make_filter();
+  auto filtering_reader = FilteringReader::Make(concat_reader, filter);
+
+  return filtering_reader;
+}
+
+Result<DocIterator::Ptr> CollectionImpl::CreateIterator(
+    const IteratorOptions &options) {
+  // Note: iteration is a read-only operation and is intentionally allowed on
+  // read-only collections (a key export use-case). Scan() skips the writing
+  // segment flush when read-only.
+
+  // Scan() takes shared_lock(schema_handle_mtx_) internally and captures
+  // the schema under that lock, consistent with the reader it builds.
+  std::vector<Segment::Ptr> segments;
+  DeleteStore::Ptr delete_store;
+  CollectionSchema::Ptr schema;
+  auto reader_result = Scan(options, segments, delete_store, schema);
+  if (!reader_result) {
+    return tl::make_unexpected(reader_result.error());
+  }
+
+  // Create DocIterator, keeping segments + delete_store alive
+  auto impl = std::make_unique<DocIterator::Impl>();
+  impl->reader = std::move(reader_result.value());
+  impl->schema = std::move(schema);
+  impl->segments = std::move(segments);
+  impl->delete_store = std::move(delete_store);
+  impl->include_vector = options.include_vector_;
+
+  return std::make_shared<DocIterator>(DocIterator::Passkey{}, std::move(impl));
 }
 
 }  // namespace zvec
