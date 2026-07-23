@@ -28,11 +28,13 @@ Status SegmentManager::add_segment(Segment::Ptr segment) {
     return Status::InvalidArgument("Segment is null");
   }
 
+  std::unique_lock<std::shared_mutex> lock(mutex_);
   segments_map_[segment->id()] = segment;
   return Status::OK();
 }
 
 Status SegmentManager::remove_segment(SegmentID segment_id) {
+  std::unique_lock<std::shared_mutex> lock(mutex_);
   auto iter = segments_map_.find(segment_id);
   if (iter == segments_map_.end()) {
     return Status::NotFound("Segment not found");
@@ -43,6 +45,7 @@ Status SegmentManager::remove_segment(SegmentID segment_id) {
 }
 
 Status SegmentManager::destroy_segment(SegmentID segment_id) {
+  std::unique_lock<std::shared_mutex> lock(mutex_);
   auto iter = segments_map_.find(segment_id);
   if (iter == segments_map_.end()) {
     return Status::NotFound("Segment not found");
@@ -57,8 +60,11 @@ Status SegmentManager::destroy_segment(SegmentID segment_id) {
 
 std::vector<Segment::Ptr> SegmentManager::get_segments() const {
   std::vector<Segment::Ptr> segments;
-  for (auto &pair : segments_map_) {
-    segments.push_back(pair.second);
+  {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    for (auto &pair : segments_map_) {
+      segments.push_back(pair.second);
+    }
   }
   std::sort(segments.begin(), segments.end(),
             [](Segment::Ptr a, Segment::Ptr b) {
@@ -69,8 +75,11 @@ std::vector<Segment::Ptr> SegmentManager::get_segments() const {
 
 std::vector<SegmentMeta::Ptr> SegmentManager::get_segments_meta() const {
   std::vector<SegmentMeta::Ptr> segments_meta;
-  for (auto &pair : segments_map_) {
-    segments_meta.push_back(pair.second->meta());
+  {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    for (auto &pair : segments_map_) {
+      segments_meta.push_back(pair.second->meta());
+    }
   }
 
   std::sort(segments_meta.begin(), segments_meta.end(),
@@ -89,8 +98,11 @@ Status SegmentManager::add_column(const FieldSchema::Ptr &column_schema,
   }
 
   std::vector<std::future<Status>> futures;
-  std::vector<std::pair<SegmentID, Segment::Ptr>> segments(
-      segments_map_.begin(), segments_map_.end());
+  std::vector<std::pair<SegmentID, Segment::Ptr>> segments;
+  {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    segments.assign(segments_map_.begin(), segments_map_.end());
+  }
 
   for (size_t i = 0; i < segments.size(); i += concurrency) {
     size_t end = std::min(i + concurrency, segments.size());
@@ -122,8 +134,11 @@ Status SegmentManager::alter_column(const std::string &column_name,
   }
 
   std::vector<std::future<Status>> futures;
-  std::vector<std::pair<SegmentID, Segment::Ptr>> segments(
-      segments_map_.begin(), segments_map_.end());
+  std::vector<std::pair<SegmentID, Segment::Ptr>> segments;
+  {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    segments.assign(segments_map_.begin(), segments_map_.end());
+  }
 
   for (size_t i = 0; i < segments.size(); i += concurrency) {
     size_t end = std::min(i + concurrency, segments.size());
@@ -148,7 +163,15 @@ Status SegmentManager::alter_column(const std::string &column_name,
 }
 
 Status SegmentManager::drop_column(const std::string &column_name) {
-  for (auto &[segment_id, segment] : segments_map_) {
+  std::vector<Segment::Ptr> segments;
+  {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    for (auto &[segment_id, segment] : segments_map_) {
+      segments.push_back(segment);
+    }
+  }
+
+  for (auto &segment : segments) {
     auto s = segment->drop_column(column_name);
     CHECK_RETURN_STATUS(s);
   }

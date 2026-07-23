@@ -238,6 +238,8 @@ class CollectionImpl : public Collection {
 
   mutable std::shared_mutex schema_handle_mtx_;
   mutable std::shared_mutex write_mtx_;
+  // serializes concurrent Optimize calls
+  mutable std::mutex optimize_mtx_;
 
   std::atomic<SegmentID> segment_id_allocator_;
   std::atomic<SegmentID> tmp_segment_id_allocator_;
@@ -779,9 +781,14 @@ std::vector<SegmentTask::Ptr> CollectionImpl::build_drop_scalar_index_task(
 Status CollectionImpl::Optimize(const OptimizeOptions &options) {
   CHECK_COLLECTION_READONLY_RETURN_STATUS;
 
-  std::lock_guard lock(schema_handle_mtx_);
-  // when optimizing, schema operations(include another optimize) are not
-  // allowed
+  // serialize concurrent optimize calls
+  std::lock_guard optimize_lock(optimize_mtx_);
+
+  // Hold the schema lock in shared mode so that writes and reads (which
+  // also take it in shared mode) can proceed during the long-running
+  // compact, while schema operations and close/destroy (which take it in
+  // exclusive mode) are kept out for the whole optimize.
+  std::shared_lock lock(schema_handle_mtx_);
 
   CHECK_DESTROY_RETURN_STATUS(destroyed_, false);
 

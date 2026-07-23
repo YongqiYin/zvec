@@ -14,6 +14,8 @@
 
 #include "zvec/db/collection.h"
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -23,6 +25,7 @@
 #include <mutex>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 #include <gtest/gtest.h>
@@ -2914,6 +2917,81 @@ TEST_F(CollectionTest, Feature_Optimize_General) {
   for (bool enable_mmap : {true, false}) {
     func(enable_mmap, 0);
     func(enable_mmap, 4);
+  }
+}
+
+TEST_F(CollectionTest, Feature_Optimize_Concurrent_Insert_NonBlocking) {
+  // Regression test: Optimize() used to hold the exclusive schema lock for
+  // its whole duration, blocking Insert/Fetch until the compact finished.
+  // Writes and reads must make progress while a background Optimize is
+  // running.
+  int initial_doc_count = 20000;
+
+  auto schema = TestHelper::CreateSchemaWithVectorIndex();
+  auto options = CollectionOptions{false, true, 64 * 1024 * 1024};
+  auto collection = TestHelper::CreateCollectionWithDoc(
+      col_path, *schema, options, 0, initial_doc_count, false);
+  ASSERT_NE(collection, nullptr);
+  ASSERT_TRUE(collection->Flush().ok());
+
+  std::atomic<bool> optimize_done{false};
+  Status optimize_status;
+  std::thread optimizer([&] {
+    optimize_status = collection->Optimize(OptimizeOptions{0});
+    optimize_done.store(true);
+  });
+
+  // give the optimizer time to take its locks and start compacting
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+  int batch_size = 100;
+  int inserted = 0;
+  int batches_during_optimize = 0;
+  uint64_t next_doc_id = initial_doc_count;
+  while (!optimize_done.load() && inserted < 100000) {
+    std::vector<Doc> docs;
+    for (int i = 0; i < batch_size; i++) {
+      docs.push_back(TestHelper::CreateDoc(next_doc_id + i, *schema));
+    }
+    auto res = collection->Insert(docs);
+    ASSERT_TRUE(res.has_value());
+    for (auto &st : res.value()) {
+      ASSERT_TRUE(st.ok());
+    }
+    next_doc_id += batch_size;
+    inserted += batch_size;
+    if (!optimize_done.load()) {
+      batches_during_optimize++;
+    }
+
+    // reads must also make progress, including while Optimize commits its
+    // result (exercises SegmentManager under concurrent access)
+    auto fetched = collection->Fetch({TestHelper::MakePK(0)});
+    ASSERT_TRUE(fetched.has_value());
+    ASSERT_EQ(fetched.value().size(), 1);
+  }
+
+  optimizer.join();
+  ASSERT_TRUE(optimize_status.ok());
+
+  // if Insert had been blocked for the whole Optimize duration, no batch
+  // could have completed while Optimize was still running
+  ASSERT_GE(batches_during_optimize, 2);
+
+  auto stats = collection->Stats().value();
+  ASSERT_EQ(stats.doc_count, (uint64_t)(initial_doc_count + inserted));
+
+  // spot-check data written before, during and after the optimize
+  for (uint64_t doc_id :
+       std::vector<uint64_t>{0, (uint64_t)initial_doc_count - 1,
+                             (uint64_t)initial_doc_count, next_doc_id - 1}) {
+    auto expect_doc = TestHelper::CreateDoc(doc_id, *schema);
+    auto result = collection->Fetch({expect_doc.pk()});
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result.value().count(expect_doc.pk()), 1);
+    auto doc = result.value()[expect_doc.pk()];
+    ASSERT_NE(doc, nullptr);
+    ASSERT_EQ(*doc, expect_doc);
   }
 }
 
