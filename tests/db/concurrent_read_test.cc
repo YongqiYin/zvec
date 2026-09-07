@@ -1,24 +1,27 @@
-// Regression test for concurrent point reads.
+// Regression tests for concurrent reads against a writer.
 //
-// Guards two things at once:
-//  1. The segment-list read path (CollectionImpl::fetch -> get_all_segments):
-//     before the write_mtx_ fix, readers raced the writer's segment switch,
-//     which crashes on Linux (SIGSEGV inside the Arrow table rebuild) and
-//     silently corrupts results elsewhere.
-//  2. Concurrent readers on both storage paths, which the former exclusive
-//     seg_mtx_/cache_mtx_ never allowed: the vector indexer path and the
-//     MemForwardStore::cache_ path.
+// Both read entry points are covered because they take different locks and
+// different storage paths:
+//  - fetch() -> SegmentImpl::Fetch(doc) under seg_mtx_;
+//  - query() -> the planner's fan-out to SegmentImpl::fetch()/scan() under
+//    seg_col_mtx_, plus the per-segment vector indexes.
+// Both obtain their segment list from get_all_segments() and both run while the
+// writer crosses segment switches, which is where dump()/flush() tears down
+// memory_store_ and republishes it as a persisted block. On the unfixed
+// baseline each of them crashes there (SIGSEGV inside the Arrow table rebuild)
+// or silently drops the rows of the block being republished.
 //
-// Two workloads are exercised because they reach different code:
+// The fetch case runs two workloads because they reach different storage code:
 //  - with a writer, flush() moves the preloaded docs into persisted blocks,
 //    so reads go through the mmap path;
 //  - without a writer, the preloaded docs stay in MemForwardStore's in-memory
 //    rows (mostly batches_, tail in cache_), every read takes the shared
 //    cache_mtx_ critical section.
 //
-// The check is content-based, not just crash-based: every fetched doc is
-// compared field by field against the deterministic doc the generator
-// produces for that id, so silent corruption fails the test.
+// Both checks are content-based, not just crash-based: the generator derives
+// every field from the doc id, so a fetched doc is compared field by field and
+// a queried doc has its scalar value checked against the pk it came back with.
+// Silent corruption and silently dropped rows both fail the test.
 
 #include <atomic>
 #include <chrono>
@@ -37,7 +40,7 @@ namespace test {
 
 namespace {
 
-const char *kPath = "concurrent_fetch_col";
+const char *kPath = "concurrent_read_col";
 
 constexpr uint32_t kMaxBufferSize = 8 * 1024 * 1024;  // force frequent flush()
 // Small enough that the writer crosses segment switches even when it is
@@ -95,7 +98,7 @@ void Note(ReaderResult *r, const std::string &msg) {
 
 }  // namespace
 
-class ConcurrentFetchTest : public ::testing::Test {
+class ConcurrentReadTest : public ::testing::Test {
  protected:
   void SetUp() override {
     zvec::ailego::MemoryLimitPool::get_instance().init(4 * 1024ll * 1024ll *
@@ -107,7 +110,7 @@ class ConcurrentFetchTest : public ::testing::Test {
   }
 };
 
-TEST_F(ConcurrentFetchTest, FetchReturnsCorrectContentUnderConcurrency) {
+TEST_F(ConcurrentReadTest, FetchReturnsCorrectContentUnderConcurrency) {
   auto schema = TestHelper::CreateSchemaWithVectorIndex();
   schema->set_max_doc_count_per_segment(kMaxDocPerSegment);
   auto options = CollectionOptions{false, true, kMaxBufferSize};
@@ -221,12 +224,7 @@ TEST_F(ConcurrentFetchTest, FetchReturnsCorrectContentUnderConcurrency) {
   }
 }
 
-TEST_F(ConcurrentFetchTest, QuerySucceedsUnderConcurrentWrites) {
-  // query() reaches a different read path than fetch(): the planner fans out
-  // to Segment::fetch()/scan() under seg_col_mtx_ and to the per-segment
-  // vector indexes, neither of which Fetch(doc) goes through. It shares the
-  // get_all_segments() window and the segment-switch teardown, so it must
-  // survive the same concurrency.
+TEST_F(ConcurrentReadTest, QueryReturnsCompleteResultsUnderConcurrency) {
   auto schema = TestHelper::CreateSchemaWithVectorIndex();
   schema->set_max_doc_count_per_segment(kMaxDocPerSegment);
   auto options = CollectionOptions{false, true, kMaxBufferSize};
@@ -242,9 +240,10 @@ TEST_F(ConcurrentFetchTest, QuerySucceedsUnderConcurrentWrites) {
   const std::string vector_bytes(reinterpret_cast<const char *>(vector->data()),
                                  vector->size() * sizeof(float));
 
-  // The schema is non-nullable, so every requested field must come back with a
-  // value on every hit. A null means that row was dropped while the planner
-  // fanned out over the segments.
+  // Every field is derived from the doc id and the pk is "pk_<id>", so a hit
+  // must carry the value belonging to its own pk. A missing value means the row
+  // was dropped while the planner fanned out over the segments; a wrong one
+  // means rows from different blocks got stitched together.
   constexpr const char *kProbeField = "int32";
 
   std::atomic<bool> stop{false};
@@ -252,8 +251,10 @@ TEST_F(ConcurrentFetchTest, QuerySucceedsUnderConcurrentWrites) {
   std::atomic<long> writer_errors{0};
   std::atomic<long> queries{0};
   std::atomic<long> query_errors{0};
+  std::atomic<long> tolerated_errors{0};
   std::atomic<long> empty_results{0};
   std::atomic<long> null_fields{0};
+  std::atomic<long> mismatches{0};
   std::atomic<long> short_results{0};
 
   auto t0 = std::chrono::steady_clock::now();
@@ -275,10 +276,13 @@ TEST_F(ConcurrentFetchTest, QuerySucceedsUnderConcurrentWrites) {
         if (!r.has_value()) {
           // Known transient: a doc admitted by the writing segment's
           // streaming vector index may not be in its forward store yet
-          // (pre-existing Insert/Query race, unrelated to this fix).
+          // (pre-existing Insert/Query race, unrelated to this fix). Counted
+          // separately instead of ignored, so it stays visible.
           if (r.error().message().find("fetch table failed") ==
               std::string::npos) {
             query_errors.fetch_add(1, std::memory_order_relaxed);
+          } else {
+            tolerated_errors.fetch_add(1, std::memory_order_relaxed);
           }
           continue;
         }
@@ -287,8 +291,15 @@ TEST_F(ConcurrentFetchTest, QuerySucceedsUnderConcurrentWrites) {
           continue;
         }
         for (const auto &doc : r.value()) {
-          if (!doc->get<int32_t>(kProbeField).has_value()) {
+          auto value = doc->get<int32_t>(kProbeField);
+          if (!value.has_value()) {
             null_fields.fetch_add(1, std::memory_order_relaxed);
+            break;
+          }
+          const std::string pk = doc->pk();
+          if (pk.size() <= 3 ||
+              static_cast<uint64_t>(*value) != TestHelper::ExtractDocId(pk)) {
+            mismatches.fetch_add(1, std::memory_order_relaxed);
             break;
           }
         }
@@ -310,16 +321,17 @@ TEST_F(ConcurrentFetchTest, QuerySucceedsUnderConcurrentWrites) {
       std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
           .count();
   std::printf(
-      "query workload: queries=%ld (%.0f/s) errors=%ld empty=%ld nulls=%ld "
-      "short=%ld writes=%ld\n",
+      "query workload: queries=%ld (%.0f/s) errors=%ld tolerated=%ld empty=%ld "
+      "nulls=%ld mismatch=%ld short=%ld writes=%ld\n",
       queries.load(), queries.load() / elapsed, query_errors.load(),
-      empty_results.load(), null_fields.load(), short_results.load(),
-      docs_written.load());
+      tolerated_errors.load(), empty_results.load(), null_fields.load(),
+      mismatches.load(), short_results.load(), docs_written.load());
 
   EXPECT_GT(queries.load(), 0);
   EXPECT_EQ(query_errors.load(), 0);
   EXPECT_EQ(empty_results.load(), 0);
   EXPECT_EQ(null_fields.load(), 0);
+  EXPECT_EQ(mismatches.load(), 0);
   EXPECT_EQ(short_results.load(), 0);
   EXPECT_EQ(writer_errors.load(), 0);
   EXPECT_GE(docs_written.load(),
