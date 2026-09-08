@@ -128,6 +128,10 @@ class SegmentImpl : public Segment,
 
   SegmentID id() const override;
 
+  void doc_id_range(uint64_t *min_id, uint64_t *max_id) const override;
+
+  uint64_t doc_count_snapshot() const override;
+
   SegmentMeta::Ptr meta() const override;
 
   uint64_t doc_count(const IndexFilter::Ptr filter = nullptr) override;
@@ -421,16 +425,12 @@ class SegmentImpl : public Segment,
 
   bool sealed_{false};
 
-  // Single segment lock guarding all mutable segment state: doc_ids_,
-  // memory_store_, persist_stores_, the forward stores, the vector indexer
-  // maps, the column set and the block metadata. Writers (Insert/Update/
-  // Upsert/Delete and the buffer-full flush() they trigger, dump(), recover(),
-  // close(), the column DDL) and the memory-component rebuild
-  // (init/finish_memory_components) take it exclusive; read-only accessors
-  // (Fetch, get_global_doc_id, fetch()/scan()/get_combined_vector_indexer())
-  // take it shared. Public entry points acquire it; the *_unsafe helpers and
-  // the memory-component rebuild assume the caller already holds it, so a
-  // nested call never locks the non-recursive mutex twice.
+  // Single lock for all mutable segment state: doc_ids_, the forward
+  // stores, the indexer maps, the column set and the block metadata. Write
+  // paths (Insert family and its buffer-full flush, dump, recover, close,
+  // DDL, init/finish_memory_components) take it exclusive; read accessors
+  // take it shared. Public entries lock; the *_unsafe helpers and the
+  // memory-component rebuild assume the caller already holds it.
   mutable std::shared_mutex seg_mtx_;
 
   bool need_destroyed_{false};
@@ -578,10 +578,9 @@ Status SegmentImpl::Create(const SegmentOptions &options, uint64_t min_doc_id) {
 }
 
 Status SegmentImpl::close() {
-  // Exclusive: flush() below runs finish_memory_components(), which rewrites
-  // memory_store_/persist_stores_ that concurrent readers hold seg_mtx_ shared
-  // for. The other write entry points hold seg_mtx_ before reaching flush();
-  // close() is reached from destroy() without it, so it takes the lock here.
+  // Exclusive: flush() below rewrites memory_store_/persist_stores_ that
+  // readers hold seg_mtx_ shared for. Reached from destroy() without the
+  // lock, so it takes it here.
   std::lock_guard<std::shared_mutex> lock(seg_mtx_);
   flush();
   if (invert_indexers_) {
@@ -628,6 +627,19 @@ SegmentID SegmentImpl::id() const {
 
 SegmentMeta::Ptr SegmentImpl::meta() const {
   return segment_meta_;
+}
+
+void SegmentImpl::doc_id_range(uint64_t *min_id, uint64_t *max_id) const {
+  // Shared: Insert and flush() rewrite the writing-forward block that backs
+  // these bounds, so an unlocked reader can observe a torn range.
+  std::shared_lock<std::shared_mutex> lock(seg_mtx_);
+  *min_id = segment_meta_->min_doc_id();
+  *max_id = segment_meta_->max_doc_id();
+}
+
+uint64_t SegmentImpl::doc_count_snapshot() const {
+  std::shared_lock<std::shared_mutex> lock(seg_mtx_);
+  return segment_meta_->doc_count();
 }
 
 uint64_t SegmentImpl::doc_count(const IndexFilter::Ptr filter) {
@@ -1364,9 +1376,8 @@ Doc::Ptr SegmentImpl::Fetch(
 
 CombinedVectorColumnIndexer::Ptr SegmentImpl::get_combined_vector_indexer(
     const std::string &field_name) const {
-  // Shared: finish_memory_components() migrates entries between these maps
-  // under the exclusive lock. Reading them unlocked can miss an indexer or
-  // count it twice, once from each map.
+  // Shared: finish_memory_components() migrates entries between these maps,
+  // so an unlocked read can miss an indexer or count it twice.
   std::shared_lock<std::shared_mutex> lock(seg_mtx_);
   std::vector<VectorColumnIndexer::Ptr> indexers;
   auto iter = vector_indexers_.find(field_name);
@@ -2108,6 +2119,9 @@ Status SegmentImpl::dump() {
 }
 
 Status SegmentImpl::flush() {
+  // Requires seg_mtx_ (Insert's buffer-full path, dump, close) or the
+  // collection's exclusive schema lock (CollectionImpl::flush): finish_/
+  // init_memory_components() below run unlocked against seg_mtx_ readers.
   CHECK_SEGMENT_READONLY_RETURN_STATUS;
 
   if (wal_file_ == nullptr || !wal_file_->has_record()) {
@@ -4108,10 +4122,8 @@ VectorColumnIndexer::Ptr SegmentImpl::create_vector_indexer(
 }
 
 Status SegmentImpl::init_memory_components() {
-  // Rebuilds memory_store_ and the indexer maps that readers reach under a
-  // shared seg_mtx_. Callers (internal_insert via Insert/Update/Upsert,
-  // recover) already hold the exclusive seg_mtx_, so this must not re-lock the
-  // non-recursive mutex.
+  // Caller must hold seg_mtx_ exclusively (Insert paths, recover); it must
+  // not re-lock.
 
   // Roll back any partially-created components on failure so a failed init
   // leaves memory_store_ null (the caller's `if (!memory_store_)` retry guard
@@ -4380,12 +4392,8 @@ Status SegmentImpl::append_wal(const Doc &doc) {
 }
 
 Status SegmentImpl::finish_memory_components() {
-  // Migrates memory_store_/persist_stores_ and the indexer maps that readers
-  // reach under a shared seg_mtx_; a reader running between the close() below
-  // and the push_back() would find neither store and silently drop that
-  // block's rows. Callers reach this only through flush() on a write path
-  // (Insert/dump/recover/close), all holding the exclusive seg_mtx_, so this
-  // must not re-lock the non-recursive mutex.
+  // Caller must hold seg_mtx_ exclusively, or the collection's exclusive
+  // schema lock (via CollectionImpl::flush()); it must not re-lock.
 
   auto block = segment_meta_->writing_forward_block().value();
 

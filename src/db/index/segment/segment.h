@@ -65,6 +65,20 @@ class Segment {
 
   virtual SegmentMeta::Ptr meta() const = 0;
 
+  // Doc-id bounds for routing. The default reads the meta unlocked; SegmentImpl
+  // overrides it to take the shared segment lock, so concurrent callers must
+  // not read min/max_doc_id() off meta() directly.
+  virtual void doc_id_range(uint64_t *min_id, uint64_t *max_id) const {
+    *min_id = meta()->min_doc_id();
+    *max_id = meta()->max_doc_id();
+  }
+
+  // Like doc_id_range(): total doc count for planners; SegmentImpl overrides
+  // it to take the shared segment lock.
+  virtual uint64_t doc_count_snapshot() const {
+    return meta()->doc_count();
+  }
+
   // Count documents visible to an optional global-doc-ID filter.
   virtual uint64_t doc_count(const IndexFilter::Ptr filter = nullptr) = 0;
 

@@ -1,27 +1,21 @@
 // Regression tests for concurrent reads against a writer.
 //
-// Both read entry points are covered because they take different locks and
-// different storage paths:
-//  - fetch() -> SegmentImpl::Fetch(doc) under seg_mtx_;
-//  - query() -> the planner's fan-out to SegmentImpl::fetch()/scan() under
-//    seg_col_mtx_, plus the per-segment vector indexes.
-// Both obtain their segment list from get_all_segments() and both run while the
-// writer crosses segment switches, which is where dump()/flush() tears down
-// memory_store_ and republishes it as a persisted block. On the unfixed
-// baseline each of them crashes there (SIGSEGV inside the Arrow table rebuild)
-// or silently drops the rows of the block being republished.
+// fetch() and query() both take their segment list from get_all_segments()
+// and both run while the writer crosses segment switches, where dump()/
+// flush() tears down memory_store_ and republishes it as a persisted block.
+// They reach different storage code — Fetch(doc) vs the planner's fan-out to
+// fetch()/scan() and the per-segment vector indexes — so both are covered. On
+// the unfixed baseline each crashes there (SIGSEGV inside the Arrow table
+// rebuild) or silently drops the rows of the block being republished.
 //
-// The fetch case runs two workloads because they reach different storage code:
-//  - with a writer, flush() moves the preloaded docs into persisted blocks,
-//    so reads go through the mmap path;
-//  - without a writer, the preloaded docs stay in MemForwardStore's in-memory
-//    rows (mostly batches_, tail in cache_), every read takes the shared
-//    cache_mtx_ critical section.
+// The fetch case runs with and without a writer because they reach different
+// storage code: with one, flush() moves the preloaded docs into persisted
+// blocks (mmap path); without one, they stay in MemForwardStore's in-memory
+// rows under the shared cache_mtx_.
 //
 // Both checks are content-based, not just crash-based: the generator derives
 // every field from the doc id, so a fetched doc is compared field by field and
 // a queried doc has its scalar value checked against the pk it came back with.
-// Silent corruption and silently dropped rows both fail the test.
 
 #include <atomic>
 #include <chrono>

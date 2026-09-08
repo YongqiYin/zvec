@@ -493,8 +493,9 @@ Status CollectionImpl::destroy() {
 Status CollectionImpl::flush() {
   CHECK_COLLECTION_READONLY_RETURN_STATUS;
 
-  // Only flushes the writing segment's WAL (no schema/segment-structure
-  // change), so it needs neither maintenance_mtx_ nor exclusion from a
+  // The exclusive schema lock also excludes all readers, which the writing
+  // segment's flush() relies on (it runs finish_memory_components() without
+  // the segment lock); it needs no maintenance_mtx_ and does not block on a
   // running optimize.
   std::lock_guard lock(schema_handle_mtx_);
   CHECK_DESTROY_RETURN_STATUS(destroyed_, false);
@@ -2382,8 +2383,10 @@ Segment::Ptr CollectionImpl::local_segment_by_doc_id(
 
   while (left < right) {
     size_t mid = left + (right - left) / 2;
-    uint64_t min_id = segments[mid]->meta()->min_doc_id();
-    uint64_t max_id = segments[mid]->meta()->max_doc_id();
+    uint64_t min_id = 0;
+    uint64_t max_id = 0;
+    // Locked: Insert and flush() rewrite the writing segment's bounds.
+    segments[mid]->doc_id_range(&min_id, &max_id);
 
     if (doc_id < min_id) {
       right = mid;
