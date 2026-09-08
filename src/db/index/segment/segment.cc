@@ -337,6 +337,12 @@ class SegmentImpl : public Segment,
       const std::shared_ptr<arrow::ChunkedArray> &data,
       InvertedColumnIndexer::Ptr *column_indexer);
 
+  // Require seg_mtx_. Public fetch() overloads acquire it before entering
+  // these helpers, so a nested fetch call never locks the mutex twice.
+  TablePtr fetch_unsafe(const std::vector<std::string> &columns,
+                        const std::vector<int> &segment_doc_ids) const;
+  ExecBatchPtr fetch_exec_unsafe(const std::vector<std::string> &columns,
+                                 int segment_doc_id) const;
   TablePtr fetch_normal(const std::vector<std::string> &columns,
                         const std::shared_ptr<arrow::Schema> &result_schema,
                         const std::vector<int> &segment_doc_ids) const;
@@ -415,18 +421,17 @@ class SegmentImpl : public Segment,
 
   bool sealed_{false};
 
-  // Guards the segment state rewritten by Insert/Update/Upsert/Delete, the
-  // buffer-full flush() they trigger, and the segment-switch dump(): doc_ids_,
-  // memory_store_, persist_stores_, the vector indexer maps and the block
-  // metadata. Read-only accessors (Fetch, get_global_doc_id) take it shared.
+  // Single segment lock guarding all mutable segment state: doc_ids_,
+  // memory_store_, persist_stores_, the forward stores, the vector indexer
+  // maps, the column set and the block metadata. Writers (Insert/Update/
+  // Upsert/Delete and the buffer-full flush() they trigger, dump(), recover(),
+  // close(), the column DDL) and the memory-component rebuild
+  // (init/finish_memory_components) take it exclusive; read-only accessors
+  // (Fetch, get_global_doc_id, fetch()/scan()/get_combined_vector_indexer())
+  // take it shared. Public entry points acquire it; the *_unsafe helpers and
+  // the memory-component rebuild assume the caller already holds it, so a
+  // nested call never locks the non-recursive mutex twice.
   mutable std::shared_mutex seg_mtx_;
-
-  // Guards readers of the forward stores, the vector indexer maps and the
-  // column set: fetch_normal()/scan()/get_combined_vector_indexer() take it
-  // shared, while the column DDL and the memory-component rebuild
-  // (init/finish_memory_components) take it exclusive. Always acquired after
-  // seg_mtx_, never before.
-  mutable std::shared_mutex seg_col_mtx_;
 
   bool need_destroyed_{false};
 
@@ -573,6 +578,11 @@ Status SegmentImpl::Create(const SegmentOptions &options, uint64_t min_doc_id) {
 }
 
 Status SegmentImpl::close() {
+  // Exclusive: flush() below runs finish_memory_components(), which rewrites
+  // memory_store_/persist_stores_ that concurrent readers hold seg_mtx_ shared
+  // for. The other write entry points hold seg_mtx_ before reaching flush();
+  // close() is reached from destroy() without it, so it takes the lock here.
+  std::lock_guard<std::shared_mutex> lock(seg_mtx_);
   flush();
   if (invert_indexers_) {
     invert_indexers_.reset();
@@ -1098,7 +1108,7 @@ Doc::Ptr SegmentImpl::Fetch(
   auto result_schema = std::make_shared<arrow::Schema>(fields);
 
   // fetch forward columns
-  auto exec_batch = fetch(forward_columns, segment_doc_id);
+  auto exec_batch = fetch_exec_unsafe(forward_columns, segment_doc_id);
   if (!exec_batch) {
     LOG_ERROR("Fetch failed, doc_id: %zu", (size_t)g_doc_id);
     return nullptr;
@@ -1357,7 +1367,7 @@ CombinedVectorColumnIndexer::Ptr SegmentImpl::get_combined_vector_indexer(
   // Shared: finish_memory_components() migrates entries between these maps
   // under the exclusive lock. Reading them unlocked can miss an indexer or
   // count it twice, once from each map.
-  std::shared_lock<std::shared_mutex> lock(seg_col_mtx_);
+  std::shared_lock<std::shared_mutex> lock(seg_mtx_);
   std::vector<VectorColumnIndexer::Ptr> indexers;
   auto iter = vector_indexers_.find(field_name);
   if (iter != vector_indexers_.end()) {
@@ -1383,7 +1393,7 @@ CombinedVectorColumnIndexer::Ptr SegmentImpl::get_combined_vector_indexer(
 CombinedVectorColumnIndexer::Ptr SegmentImpl::get_quant_combined_vector_indexer(
     const std::string &field_name) const {
   // Shared, for the same reason as get_combined_vector_indexer().
-  std::shared_lock<std::shared_mutex> lock(seg_col_mtx_);
+  std::shared_lock<std::shared_mutex> lock(seg_mtx_);
   std::vector<VectorColumnIndexer::Ptr> indexers;
   auto iter = quant_vector_indexers_.find(field_name);
   if (iter != quant_vector_indexers_.end()) {
@@ -2385,8 +2395,6 @@ TablePtr SegmentImpl::fetch_normal(
   std::map<int, std::map<std::string, std::vector<std::pair<int, int>>>>
       block_request_map;
 
-  std::shared_lock<std::shared_mutex> lock(seg_col_mtx_);
-
   const auto &block_offsets = get_persist_block_offsets(BlockType::SCALAR);
   const auto &block_metas = get_persist_block_metas(BlockType::SCALAR);
 
@@ -2576,6 +2584,13 @@ TablePtr SegmentImpl::fetch_normal(
 
 TablePtr SegmentImpl::fetch(const std::vector<std::string> &columns,
                             const std::vector<int> &segment_doc_ids) const {
+  std::shared_lock<std::shared_mutex> lock(seg_mtx_);
+  return fetch_unsafe(columns, segment_doc_ids);
+}
+
+TablePtr SegmentImpl::fetch_unsafe(
+    const std::vector<std::string> &columns,
+    const std::vector<int> &segment_doc_ids) const {
   if (!validate(columns)) {
     return nullptr;
   }
@@ -2634,12 +2649,16 @@ TablePtr SegmentImpl::fetch(const std::vector<std::string> &columns,
 
 ExecBatchPtr SegmentImpl::fetch(const std::vector<std::string> &columns,
                                 int segment_doc_id) const {
+  std::shared_lock<std::shared_mutex> lock(seg_mtx_);
+  return fetch_exec_unsafe(columns, segment_doc_id);
+}
+
+ExecBatchPtr SegmentImpl::fetch_exec_unsafe(
+    const std::vector<std::string> &columns, int segment_doc_id) const {
   if (columns.empty()) {
     LOG_ERROR("Empty columns");
     return nullptr;
   }
-
-  std::shared_lock<std::shared_mutex> lock(seg_col_mtx_);
 
   const auto &block_offsets = get_persist_block_offsets(BlockType::SCALAR);
   const auto &block_metas = get_persist_block_metas(BlockType::SCALAR);
@@ -2696,7 +2715,7 @@ ExecBatchPtr SegmentImpl::fetch(const std::vector<std::string> &columns,
       }
     }
   } else {
-    auto table = fetch(columns, std::vector<int>{segment_doc_id});
+    auto table = fetch_unsafe(columns, std::vector<int>{segment_doc_id});
     if (table) {
       std::vector<arrow::Datum> datums;
       for (const auto &col : table->columns()) {
@@ -2723,7 +2742,7 @@ RecordBatchReaderPtr SegmentImpl::scan(
     return nullptr;
   }
 
-  std::shared_lock<std::shared_mutex> lock(seg_col_mtx_);
+  std::shared_lock<std::shared_mutex> lock(seg_mtx_);
 
   const std::vector<BlockMeta> &scalar_blocks =
       get_persist_block_metas(BlockType::SCALAR);
@@ -3174,7 +3193,7 @@ Status SegmentImpl::add_column(FieldSchema::Ptr column_schema,
     invert_indexers_->flush();
   }
 
-  std::unique_lock<std::shared_mutex> lock(seg_col_mtx_);
+  std::unique_lock<std::shared_mutex> lock(seg_mtx_);
   // create and append persist scalar indexer
   for (auto &block : new_blocks) {
     auto forward_path = FileHelper::MakeForwardBlockPath(
@@ -3344,7 +3363,7 @@ Status SegmentImpl::alter_column(const std::string &column_name,
     }
   }
 
-  std::unique_lock<std::shared_mutex> lock(seg_col_mtx_);
+  std::unique_lock<std::shared_mutex> lock(seg_mtx_);
   // update old block, remove column
   std::vector<BlockMeta> &persisted_blocks = segment_meta_->persisted_blocks();
   std::vector<int> will_del_block_idx;
@@ -3439,7 +3458,7 @@ Status SegmentImpl::drop_column(const std::string &column_name) {
         "Add column is not supported for segment with memory store");
   }
 
-  std::unique_lock<std::shared_mutex> lock(seg_col_mtx_);
+  std::unique_lock<std::shared_mutex> lock(seg_mtx_);
   // update old block, remove column
   std::vector<BlockMeta> &persisted_blocks = segment_meta_->persisted_blocks();
   std::vector<int> will_del_block_idx;
@@ -4084,10 +4103,10 @@ VectorColumnIndexer::Ptr SegmentImpl::create_vector_indexer(
 }
 
 Status SegmentImpl::init_memory_components() {
-  // Exclusive for the same reason as finish_memory_components(): this rebuild
-  // clears and repopulates memory_store_ and the indexer maps that readers
-  // reach under a shared seg_col_mtx_.
-  std::lock_guard<std::shared_mutex> lock(seg_col_mtx_);
+  // Rebuilds memory_store_ and the indexer maps that readers reach under a
+  // shared seg_mtx_. Callers (internal_insert via Insert/Update/Upsert,
+  // recover) already hold the exclusive seg_mtx_, so this must not re-lock the
+  // non-recursive mutex.
 
   // Roll back any partially-created components on failure so a failed init
   // leaves memory_store_ null (the caller's `if (!memory_store_)` retry guard
@@ -4356,13 +4375,12 @@ Status SegmentImpl::append_wal(const Doc &doc) {
 }
 
 Status SegmentImpl::finish_memory_components() {
-  // Exclusive: fetch_normal()/scan() and get_combined_vector_indexer() read
-  // memory_store_, persist_stores_ and the indexer maps under a shared
-  // seg_col_mtx_. A reader that runs between the close() below and the
-  // push_back() finds neither store and silently drops that block's rows.
-  // Callers (Insert, dump) already hold the exclusive seg_mtx_, so the
-  // seg_mtx_ -> seg_col_mtx_ order is preserved.
-  std::lock_guard<std::shared_mutex> lock(seg_col_mtx_);
+  // Migrates memory_store_/persist_stores_ and the indexer maps that readers
+  // reach under a shared seg_mtx_; a reader running between the close() below
+  // and the push_back() would find neither store and silently drop that
+  // block's rows. Callers reach this only through flush() on a write path
+  // (Insert/dump/recover/close), all holding the exclusive seg_mtx_, so this
+  // must not re-lock the non-recursive mutex.
 
   auto block = segment_meta_->writing_forward_block().value();
 
