@@ -1446,6 +1446,9 @@ VectorColumnIndexer::Ptr SegmentImpl::get_memory_quant_vector_indexer(
 
 std::vector<VectorColumnIndexer::Ptr> SegmentImpl::get_vector_indexer(
     const std::string &field_name) const {
+  // Shared: finish_memory_components() appends the flushed memory indexer to
+  // this map, so an unlocked read can observe a half-updated vector.
+  std::shared_lock<std::shared_mutex> lock(seg_mtx_);
   auto iter = vector_indexers_.find(field_name);
   if (iter != vector_indexers_.end()) {
     return iter->second;
@@ -1455,6 +1458,8 @@ std::vector<VectorColumnIndexer::Ptr> SegmentImpl::get_vector_indexer(
 
 std::vector<VectorColumnIndexer::Ptr> SegmentImpl::get_quant_vector_indexer(
     const std::string &field_name) const {
+  // Shared, for the same reason as get_vector_indexer().
+  std::shared_lock<std::shared_mutex> lock(seg_mtx_);
   std::vector<VectorColumnIndexer::Ptr> col_indexers;
   auto iter = quant_vector_indexers_.find(field_name);
   if (iter != quant_vector_indexers_.end()) {
