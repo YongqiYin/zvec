@@ -1,21 +1,19 @@
 // Regression tests for concurrent reads against a writer.
 //
-// fetch() and query() both take their segment list from get_all_segments()
-// and both run while the writer crosses segment switches, where dump()/
-// flush() tears down memory_store_ and republishes it as a persisted block.
-// They reach different storage code — Fetch(doc) vs the planner's fan-out to
+// fetch() and query() both take their segment list from get_all_segments() and
+// both run while the writer crosses segment switches, where dump()/flush()
+// tears down memory_store_ and republishes it as a persisted block. They reach
+// different storage code — Fetch(doc) vs the planner's fan-out to
 // fetch()/scan() and the per-segment vector indexes — so both are covered. On
 // the unfixed baseline each crashes there (SIGSEGV inside the Arrow table
 // rebuild) or silently drops the rows of the block being republished.
 //
-// The fetch case runs with and without a writer because they reach different
-// storage code: with one, flush() moves the preloaded docs into persisted
-// blocks (mmap path); without one, they stay in MemForwardStore's in-memory
-// rows under the shared cache_mtx_.
+// The fetch case also runs without a writer, where the preloaded docs stay in
+// MemForwardStore's in-memory rows instead of the flushed mmap path.
 //
-// Both checks are content-based, not just crash-based: the generator derives
-// every field from the doc id, so a fetched doc is compared field by field and
-// a queried doc has its scalar value checked against the pk it came back with.
+// Both checks are content-based, not just crash-based: every field is derived
+// from the doc id, so fetched docs are compared field by field and queried docs
+// have their scalar value checked against the pk they came back with.
 
 #include <atomic>
 #include <chrono>
@@ -37,18 +35,17 @@ namespace {
 const char *kPath = "concurrent_read_col";
 
 constexpr uint32_t kMaxBufferSize = 8 * 1024 * 1024;  // force frequent flush()
-// Small enough that the writer crosses segment switches even when it is
-// starved by the readers: on the unfixed baseline 4 readers throttle the
-// writer to ~2.5k docs/s, so 40k docs/segment would mean no switch at all
-// within the run window — and the segment switch (dump()) is exactly where
-// the baseline crashes. 4k keeps several switches inside every window.
+// Small enough that the writer still crosses segment switches when starved by
+// the readers: on the unfixed baseline 4 readers throttle it to ~2.5k docs/s,
+// so a 40k-doc segment would never switch inside the run window — and dump()
+// is exactly where the baseline crashes.
 constexpr uint64_t kMaxDocPerSegment = 4000;
 constexpr int kStableDocs = 3000;  // pre-loaded, must always read back exactly
 constexpr int kWriteBatch = 100;
 constexpr int kRunSeconds = 8;
-// Bounds disk growth on fast machines: 50k docs ≈ 12 segments. Above the
-// baseline's ~2.5k docs/s × 8s (= 20k), so it never truncates the baseline
-// run before its first segment switch — the discriminating window is intact.
+// Bounds disk growth on fast machines (50k docs ≈ 12 segments) while staying
+// above the baseline's ~2.5k docs/s × 8s, so it never truncates the baseline
+// run before its first segment switch.
 constexpr long kMaxWriterDocs = 50000;
 
 // Inserts disjoint docs (ids far above the preloaded range) until stop or the
@@ -109,12 +106,12 @@ TEST_F(ConcurrentReadTest, FetchReturnsCorrectContentUnderConcurrency) {
   schema->set_max_doc_count_per_segment(kMaxDocPerSegment);
   auto options = CollectionOptions{false, true, kMaxBufferSize};
 
-  // The with-writer workload reads mostly persisted blocks (mmap); the
-  // no-writer one reads the in-memory store under the shared cache_mtx_.
+  // With a writer the readers hit mostly persisted blocks (mmap); without one,
+  // the in-memory store.
   for (bool with_writer : {true, false}) {
     for (int readers : {4, 8}) {
-      // Rebuilt per run so the no-writer case starts with everything still
-      // in the in-memory store rather than flushed by a previous run.
+      // Rebuilt per run so the no-writer case starts with everything still in
+      // the in-memory store rather than flushed by a previous run.
       ailego::FileHelper::RemoveDirectory(kPath);
       auto collection = TestHelper::CreateCollectionWithDoc(
           kPath, *schema, options, 0, kStableDocs, false);
@@ -127,8 +124,7 @@ TEST_F(ConcurrentReadTest, FetchReturnsCorrectContentUnderConcurrency) {
 
       auto t0 = std::chrono::steady_clock::now();
 
-      // Insert, flush and switch segments continuously (bounded by
-      // kMaxWriterDocs).
+      // Insert, flush and switch segments continuously.
       std::thread writer;
       if (with_writer) {
         writer =
@@ -158,8 +154,7 @@ TEST_F(ConcurrentReadTest, FetchReturnsCorrectContentUnderConcurrency) {
               Note(r, "doc " + expect.pk() + " came back null");
               continue;
             }
-            // Content check: any silent corruption of the forward columns or
-            // the vector payload shows up here.
+            // Catches silent corruption of the forward columns or the vector.
             if (*it->second != expect) {
               r->mismatches++;
               Note(r, "doc " + expect.pk() + " content mismatch");
@@ -202,10 +197,9 @@ TEST_F(ConcurrentReadTest, FetchReturnsCorrectContentUnderConcurrency) {
       EXPECT_EQ(mism, 0) << problem;
       EXPECT_EQ(errs, 0) << problem;
       if (with_writer) {
-        // The with-writer shape is vacuous unless the writer actually ran and
-        // crossed at least one segment switch (the dump() path is where the
-        // baseline crashes): fail loudly instead of degrading to a no-writer
-        // run when inserts error out or the writer is starved.
+        // Vacuous unless the writer actually ran and crossed a segment switch
+        // (dump() is where the baseline crashes), so fail loudly instead of
+        // silently degrading to a no-writer run.
         EXPECT_EQ(writer_errors.load(), 0) << problem;
         EXPECT_GT(docs_written.load(), 0);
         EXPECT_GE(docs_written.load(),
@@ -234,10 +228,9 @@ TEST_F(ConcurrentReadTest, QueryReturnsCompleteResultsUnderConcurrency) {
   const std::string vector_bytes(reinterpret_cast<const char *>(vector->data()),
                                  vector->size() * sizeof(float));
 
-  // Every field is derived from the doc id and the pk is "pk_<id>", so a hit
-  // must carry the value belonging to its own pk. A missing value means the row
-  // was dropped while the planner fanned out over the segments; a wrong one
-  // means rows from different blocks got stitched together.
+  // Every field is derived from the doc id, so a hit must carry the value
+  // belonging to its own pk: a missing one means the row was dropped during the
+  // fan-out, a wrong one means rows from different blocks got stitched.
   constexpr const char *kProbeField = "int32";
 
   std::atomic<bool> stop{false};
@@ -268,10 +261,10 @@ TEST_F(ConcurrentReadTest, QueryReturnsCompleteResultsUnderConcurrency) {
         auto r = collection->query(q);
         queries.fetch_add(1, std::memory_order_relaxed);
         if (!r.has_value()) {
-          // Known transient: a doc admitted by the writing segment's
-          // streaming vector index may not be in its forward store yet
-          // (pre-existing Insert/Query race, unrelated to this fix). Counted
-          // separately instead of ignored, so it stays visible.
+          // Known transient: a doc admitted by the writing segment's streaming
+          // vector index may not be in its forward store yet (pre-existing
+          // Insert/Query race, unrelated to this fix). Counted separately
+          // rather than ignored, so it stays visible.
           if (r.error().message().find("fetch table failed") ==
               std::string::npos) {
             query_errors.fetch_add(1, std::memory_order_relaxed);
@@ -297,8 +290,8 @@ TEST_F(ConcurrentReadTest, QueryReturnsCompleteResultsUnderConcurrency) {
             break;
           }
         }
-        // The collection always holds far more than topk docs, so a short
-        // result means rows were dropped somewhere along the fan-out.
+        // The collection holds far more than topk docs, so a short result means
+        // rows were dropped along the fan-out.
         if (r.value().size() < static_cast<size_t>(q.topk_)) {
           short_results.fetch_add(1, std::memory_order_relaxed);
         }

@@ -268,8 +268,7 @@ arrow::Result<TablePtr> MemForwardStore::apply_row_and_column_selection(
 arrow::Result<TablePtr> MemForwardStore::convertToTable(
     const std::vector<std::string> &columns, const std::vector<int> &indices) {
   // Fast path: when every requested row sits in one source, only that source is
-  // materialised. Point fetches always land here, so their cost stops growing
-  // with how much data the store holds.
+  // materialised, so point fetches do not grow with the store's size.
   RecordBatchPtr single_source;
   std::vector<int> single_rows;
   if (locate_single_source(indices, &single_source, &single_rows)) {
@@ -399,8 +398,7 @@ Status MemForwardStore::flush_locked() {
 }
 
 Status MemForwardStore::close() {
-  // Exclusive: flush_locked() below and the clears at the end rewrite
-  // cache_/batches_, which concurrent readers hold this lock shared for.
+  // Exclusive: flush_locked() and the clears below rewrite cache_/batches_.
   std::lock_guard lock(cache_mtx_);
   if (!cache_.empty() || !batches_.empty()) {
     flush_locked();

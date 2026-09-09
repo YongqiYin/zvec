@@ -175,9 +175,8 @@ class MemForwardStore : public BaseForwardStore {
   Status flush_locked();
 
  private:
-  /// Guards cache_, batches_ and num_rows_, which insert(), flush() and
-  /// close() rewrite. Read-only accessors (get_table, fetch, scan) take it
-  /// shared so concurrent readers do not serialize against each other.
+  /// Guards cache_, batches_ and num_rows_, which insert(), flush() and close()
+  /// rewrite. Read-only accessors take it shared so readers do not serialize.
   std::shared_mutex cache_mtx_;
 
   /// Cache of documents waiting to be flushed

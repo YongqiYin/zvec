@@ -209,9 +209,8 @@ class CollectionImpl : public Collection {
   Result<std::unique_ptr<DocIterator::Impl>> prepare_iterate(
       const IteratorOptions &options);
 
-  //! Collects the segment list under a shared write_mtx_, because
-  //! writing_segment_ and the doc_ids_ that doc_count() reads are mutated by
-  //! Insert under the exclusive write_mtx_.
+  //! Collects the segment list under a shared write_mtx_: writing_segment_ and
+  //! the doc_ids_ behind doc_count() are mutated under the exclusive one.
   std::vector<Segment::Ptr> get_all_segments() const;
 
   //! Same as get_all_segments(), for callers that already hold write_mtx_.
@@ -495,8 +494,7 @@ Status CollectionImpl::flush() {
 
   // The exclusive schema lock also excludes all readers, which the writing
   // segment's flush() relies on (it runs finish_memory_components() without
-  // the segment lock); it needs no maintenance_mtx_ and does not block on a
-  // running optimize.
+  // the segment lock).
   std::lock_guard lock(schema_handle_mtx_);
   CHECK_DESTROY_RETURN_STATUS(destroyed_, false);
   CHECK_CLOSED_RETURN_STATUS(closed_, false);
@@ -1560,8 +1558,7 @@ Result<WriteResults> CollectionImpl::upsert(std::vector<Doc> &docs) {
 
 Status CollectionImpl::internal_fetch_by_doc(const Doc &doc,
                                              Doc::Ptr *doc_out) {
-  // Called from handle_update(), i.e. under write_impl()'s exclusive
-  // write_mtx_.
+  // Called from handle_update(), i.e. under write_impl()'s write_mtx_.
   auto segments = get_all_segments_unsafe();
   uint64_t doc_id;
   bool has = id_map_->has(doc.pk(), &doc_id);
@@ -1727,7 +1724,7 @@ Status CollectionImpl::switch_to_new_segment_for_writing(
 
   Version version = version_manager_->get_current_version();
   auto writing_segment_meta = writing_segment_->meta();
-  writing_segment_meta->remove_writing_forward_block();
+  writing_segment_->remove_writing_forward_block();
   s = version.add_persisted_segment_meta(writing_segment_meta);
   CHECK_RETURN_STATUS(s);
 
@@ -1778,10 +1775,9 @@ Status CollectionImpl::delete_by_filter(const std::string &filter) {
   query.include_doc_id_ = true;
 
   // The matched set decides what gets deleted, so it must reflect one
-  // collection state. Hold write_mtx_ shared across the scan to exclude
-  // concurrent write batches; get_all_segments_unsafe() reuses this lock
-  // rather than re-acquiring it. Plain queries tolerate a mid-write view and
-  // so skip this, but delete needs the stronger guarantee.
+  // collection state: hold write_mtx_ shared across the scan to exclude
+  // concurrent write batches. Plain queries tolerate a mid-write view and skip
+  // this; delete needs the stronger guarantee.
   auto ret = [&]() {
     std::shared_lock<std::shared_mutex> write_lock(write_mtx_);
     return sql_engine_->execute(schema_, std::move(query),
@@ -2393,7 +2389,6 @@ Segment::Ptr CollectionImpl::local_segment_by_doc_id(
     size_t mid = left + (right - left) / 2;
     uint64_t min_id = 0;
     uint64_t max_id = 0;
-    // Locked: Insert and flush() rewrite the writing segment's bounds.
     segments[mid]->doc_id_range(&min_id, &max_id);
 
     if (doc_id < min_id) {

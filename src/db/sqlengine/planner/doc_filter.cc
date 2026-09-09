@@ -112,8 +112,7 @@ std::optional<std::vector<uint64_t>> DocFilter::get_bf_by_keys_and_update(
   if (!invert_result_) {
     return std::nullopt;
   }
-  // Locked: Insert and flush() rewrite the writing-forward block behind
-  // doc_count(), so read it through the segment lock.
+  // Insert/flush() rewrite the block behind doc_count(), so read it locked.
   size_t doc_count = segment_->doc_count_snapshot();
   uint64_t bf_by_keys_threshold = static_cast<uint64_t>(doc_count * ratio);
 

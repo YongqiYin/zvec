@@ -550,6 +550,8 @@ class MockSegment : public Segment {
     return Status::OK();
   }
 
+  void remove_writing_forward_block() override {}
+
   Status destroy() override {
     return Status::OK();
   }
