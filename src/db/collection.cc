@@ -1777,8 +1777,16 @@ Status CollectionImpl::delete_by_filter(const std::string &filter) {
   query.output_fields_ = std::vector<std::string>{};
   query.include_doc_id_ = true;
 
-  auto ret =
-      sql_engine_->execute(schema_, std::move(query), get_all_segments());
+  // The matched set decides what gets deleted, so it must reflect one
+  // collection state. Hold write_mtx_ shared across the scan to exclude
+  // concurrent write batches; get_all_segments_unsafe() reuses this lock
+  // rather than re-acquiring it. Plain queries tolerate a mid-write view and
+  // so skip this, but delete needs the stronger guarantee.
+  auto ret = [&]() {
+    std::shared_lock<std::shared_mutex> write_lock(write_mtx_);
+    return sql_engine_->execute(schema_, std::move(query),
+                                get_all_segments_unsafe());
+  }();
   if (!ret.has_value()) {
     return ret.error();
   }
